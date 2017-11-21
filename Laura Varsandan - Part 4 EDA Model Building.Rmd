@@ -1,0 +1,204 @@
+---
+title: "Laura Varsandan Part 4 EDA"
+output: 
+  html_document: 
+       smart: false
+---
+
+Loading Libraries
+
+```{r}
+library(data.table)
+library(ggplot2)  
+
+```
+
+Loading in the data as saved at the end of Part 3.
+
+```{r}
+class_merged_hol_new_features<-fread('class_merged_hol_new_features.csv')
+head(class_merged_hol_new_features)
+```
+```{r}
+city_lat_long<-fread('city_lat_long.csv')
+head(city_lat_long)
+```
+
+
+```{r}
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,city_lat_long,by.x='city',by.y='City',all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+```{r}
+holidays_features<-fread('holidays_features.csv')
+holidays_features <- holidays_features[,2:6] # remove the index var
+holidays_features <- holidays_features[!duplicated(holidays_features),] #deduplicate it
+head(holidays_features)
+```
+```{r}
+# check for duplicates
+
+dup<-data.frame(table(holidays_features$date,holidays_features$store_nbr))
+dup[dup$Freq>1,]
+holidays_features_dedup<-holidays_features[!duplicated(holidays_features),]
+dup2<-data.frame(table(holidays_features_dedup$date,holidays_features_dedup$store_nbr))
+dup2[dup2$Freq>1,]
+holidays_features_dedup[date=="2016-05-01" & store_nbr==1,]
+
+```
+
+
+
+```{r}
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,holidays_features,by=c("date","store_nbr"),all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+```{r}
+oil <- fread("oil_price_monthly_average.csv")
+oil <- oil[,2:4]
+head(oil)
+```
+```{r}
+class_merged_hol_new_features$month_year=100*year(class_merged_hol_new_features$date)+month(class_merged_hol_new_features$date)
+head(class_merged_hol_new_features)
+```
+
+```{r}
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,oil,by=c("month_year"),all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+```{r}
+wage_days <- fread("wage_days.csv")
+wage_days <- wage_days[,2:4]
+head(wage_days)
+```
+
+```{r}
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,wage_days,by=c("date"),all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+Create a month feature as well
+
+```{r}
+class_merged_hol_new_features$month<-as.character(month(class_merged_hol_new_features$date))
+
+```
+
+```{r}
+stores <- fread("store_features_year.csv")
+stores <- stores[,2:7]
+head(stores)
+```
+
+```{r}
+class_merged_hol_new_features$date<-as.Date(class_merged_hol_new_features$date)
+class_merged_hol_new_features$year<-year(class_merged_hol_new_features$date)
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,stores,by=c("store_nbr","year"),all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+## Feature Discussion
+
+Since we are building the model to forecast sales for next month, we need to only use features which we know one month in advance. These include the following
+- the store features that best describe that store in that financial year (lat, long, transactions,transactions_on_weekend,no of items)
+- the class
+- the family
+- the date
+- the holiday events
+- the wage days
+- the oil price - we will use the previous month average price 
+
+
+Out of these features, we can group them into categorical and continous. 
+
+Continous variables:
+- sales_per_unit (our target vaiable)
+- lat
+- long
+- annual store transactions (transactions.y)
+- annual store number of items (no_items.y)
+- annual store transactions on weekend (tran_on_wknd)
+- previous month's average oil price (dcoilwtico.y)
+- nat_hol_fctr
+- reg_hol_fctr
+- loc_hol_fctr
+- earth_fctr
+- wage_fctr
+
+Categorical features
+- store_nbr
+- class
+- family
+- month
+- year
+
+Since we have a mix of categorical and continous variables, we are going to use regression trees as they don't make assumptions about linearity and they also allow working with both types of data. 
+
+## Train and Test sets
+Since July 2017 is the last full month we have information on, we will use that one as a test set. 
+
+
+
+
+## Distribution of our target variable per family type
+```{r}
+ggplot(class_merged_hol_new_features, aes(family, sales_per_unit)) + geom_boxplot(fill = "red")+
+labs(title = "Box Plot", x = "family", y="sales_per_unit")
+
+```
+
+From these we can see that we have quite a lot of outlier sections. Since these outliers are great indicators of how successful a section can be, we are going to leave them in for the model. However, for visualisation purposes, we are going to exclude them and also leave just the last 12 full months of data.
+
+```{r}
+max(class_merged_hol_new_features$date)
+viz_subset<- class_merged_hol_new_features[date>='2016-08-01' & date<='2017-07-01']
+viz_subset<- viz_subset[sales_per_unit<=500]
+```
+
+Check how many unique classes and unique families we have so that we know what we can visualize
+```{r}
+length(unique(class_merged_hol_new_features$class))
+length(unique(class_merged_hol_new_features$family))
+```
+
+334 is a high  number of categories to visualize, so let's just use the family for now. 
+
+## Visualising Continous Variables
+
+In order to have an idea about which variables might be correlated with our target variable, let's calculate the correlation matrix.
+
+```{r}
+cor_data<-viz_subset[,c("sales_per_unit","items_on_promotion","no_perishable_items","wage_factor","nat_hol_fctr","dcoilwtico.y")]
+```
+
+
+
+### 1) Sales Per Unit and Items on Promotion
+
+```{r}
+ggplot(viz_subset, aes(items_onpromotion,sales_per_unit)) + geom_point(aes(color = family)) + 
+  theme_bw() + labs(title="Scatterplot") +facet_wrap( ~ family)
+```
+
+It does look like items on promotion has different impact on differect categories, so it could be a relevant feature to include. Let' check it's correlation coefficient:
+```{r}
+cor(viz_subset$sales_per_unit,viz_subset$items_onpromotion)
+```
+
+
+
+
+Save the results so far:
+```{r}
+write.csv(class_merged_hol_new_features,"class_merged_all_features.csv")
+```
+
+
+
+Since we are dealing with a lot of data, I will build the model in a step-wise fashion.
+
+The aim of the regression is to try to predict the sales performance (sales_per_unit) for each class_combination_store
