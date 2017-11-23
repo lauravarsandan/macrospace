@@ -1,0 +1,722 @@
+---
+title: "Laura Varsandan Part 4 EDA"
+output: 
+  html_document: 
+       smart: false
+---
+
+Loading Libraries
+
+```{r}
+library(data.table)
+library(ggplot2)  
+library(dplyr)
+library(lubridate)
+library(rpart)
+```
+
+Loading in the data as saved at the end of Part 3.
+
+```{r}
+class_merged_hol_new_features<-fread('class_merged_hol_new_features.csv')
+head(class_merged_hol_new_features)
+```
+```{r}
+city_lat_long<-fread('city_lat_long.csv')
+head(city_lat_long)
+```
+
+
+```{r}
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,city_lat_long,by.x='city',by.y='City',all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+```{r}
+holidays_features<-fread('holidays_features.csv')
+holidays_features <- holidays_features[,2:6] # remove the index var
+holidays_features <- holidays_features[!duplicated(holidays_features),] #deduplicate it
+head(holidays_features)
+```
+```{r}
+# check for duplicates
+
+dup<-data.frame(table(holidays_features$date,holidays_features$store_nbr))
+dup[dup$Freq>1,]
+holidays_features_dedup<-holidays_features[!duplicated(holidays_features),]
+dup2<-data.frame(table(holidays_features_dedup$date,holidays_features_dedup$store_nbr))
+dup2[dup2$Freq>1,]
+holidays_features_dedup[date=="2016-05-01" & store_nbr==1,]
+
+```
+
+
+
+```{r}
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,holidays_features,by=c("date","store_nbr"),all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+```{r}
+oil <- fread("oil_price_monthly_average.csv")
+oil <- oil[,2:4]
+head(oil)
+```
+```{r}
+class_merged_hol_new_features$month_year=100*year(class_merged_hol_new_features$date)+month(class_merged_hol_new_features$date)
+head(class_merged_hol_new_features)
+```
+
+```{r}
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,oil,by=c("month_year"),all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+```{r}
+wage_days <- fread("wage_days.csv")
+wage_days <- wage_days[,2:4]
+head(wage_days)
+```
+
+```{r}
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,wage_days,by=c("date"),all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+Create a month feature as well
+
+```{r}
+class_merged_hol_new_features$month<-as.character(month(class_merged_hol_new_features$date))
+
+```
+
+```{r}
+stores <- fread("store_features_year.csv")
+stores <- stores[,2:7]
+head(stores)
+```
+
+```{r}
+class_merged_hol_new_features$date<-as.Date(class_merged_hol_new_features$date)
+class_merged_hol_new_features$year<-year(class_merged_hol_new_features$date)
+class_merged_hol_new_features<-merge(class_merged_hol_new_features,stores,by=c("store_nbr","year"),all.x=TRUE)
+head(class_merged_hol_new_features)
+```
+
+## Feature Discussion
+
+Since we are building the model to forecast sales for next month, we need to only use features which we know one month in advance. These include the following
+- the store features that best describe that store in that financial year (lat, long, transactions,transactions_on_weekend,no of items)
+- the class
+- the family
+- the date
+- the holiday events
+- the wage days
+- the oil price - we will use the previous month average price 
+
+
+Out of these features, we can group them into categorical and continous. 
+
+Continous variables:
+- sales_per_unit (our target vaiable)
+- lat
+- long
+- annual store transactions (transactions.y)
+- annual store number of items (no_items.y)
+- annual store transactions on weekend (tran_on_wknd)
+- previous month's average oil price (dcoilwtico.y)
+- nat_hol_fctr
+- reg_hol_fctr
+- loc_hol_fctr
+- earth_fctr
+- wage_fctr
+
+Categorical features
+- store_nbr
+- class
+- family
+- month
+- year
+
+Since we have a mix of categorical and continous variables, we are going to use a mix of time series forecasting and regression trees(?) as they don't make assumptions about linearity and they also allow working with both types of data. 
+
+## Train and Test sets
+Since July 2017 is the last full month we have information on, we will use that one as a test set. Since these decisions probably need to be made the month before, we will use our train set up to May 2016, as this prediction exercise is likely to happen during June 2017. The scope of this analysis only includes predicting results for July 2017. Whilst we will try to build a generalizable prediction model that can be applyed for all months, this is would have to be revisited each month in order to make sure it still performs as well as it should be. For example, base model predictions for January and February months will have to happen on the previous year's data and therefore adjustments to the code will be needed. 
+
+```{r}
+nrow(class_merged_hol_new_features)
+train <- class_merged_hol_new_features[date<='2017-05-01']
+test <- class_merged_hol_new_features[date>'2017-06-30' & date<'2017-07-31']
+nrow(train)
+nrow(test)
+```
+
+## Clean the workspace
+```{r}
+rm(dup)
+rm(dup2)
+rm(holidays_features)
+rm(holidays_features_dedup)
+rm(to_date)
+rm(train_base_results)
+rm(train_month)
+rm(train_month_base_results)
+rm(viz_subset)
+rm(wage_days)
+```
+
+
+## Base Model
+In order to test how powerful our predictions are, we need to develop a base model for comparison of results. 
+
+The aim of this analysis is to predict the 'sales_per_unit' for each date-store-class combination for the July 2017. In order to do this, we are going to calculate for each year the mean sales_per_unit of each store-class combination for the year up to May 2017. 
+
+```{r}
+base_model <- train[,mean(sales_per_unit),by=c('store_nbr','class','year')]
+names(base_model)[4]<-"base_prediction"
+head(base_model)
+```
+
+Let's add these values to the test datasets and calculate the how much variance it explains(R-squared) both for the train set and for the test set.
+
+```{r}
+test_base_results <- merge(test,base_model,by=c("store_nbr","class","year"),all.x=TRUE)
+head(test_base_results)
+```
+
+#Check for nulls
+```{r}
+nrow(test_base_results[is.na(base_prediction)])
+```
+
+We can see that for our test dataset we have some nulls. 
+
+```{r}
+classes_with_nulls <- unique(test_base_results[is.na(base_prediction),class])
+classes_to_date <- unique(train$class)
+classes_with_nulls %in% classes_to_date
+```
+
+For the purpose of this analysis, we are going to exclude predicting how well new launches of classes in stores are going to perform. The decision for a new launch has to be preceeded by how much space each section should be allocated. Only then comes the decision of which old or new classes should be introduced in a particular store. 
+
+Therefore in order to answer the macrospace question, we are going to assume that the same classes are going to be kept in each store for each month.
+
+```{r}
+new_launches <- test_base_results[is.na(base_prediction)]
+test_base_results <- test_base_results[is.na(base_prediction)==FALSE]
+head(test_base_results)
+```
+
+Calculating the variance explained for test set
+
+```{r}
+#total variance
+TV_test <- sum((test_base_results$sales_per_unit-mean_sales_per_unit)^2)
+TV_test
+
+#variance explained
+VE_test <-sum((test_base_results$base_prediction-mean_sales_per_unit)^2)
+R2_base<-VE_test/TV_test
+R2_base
+
+```
+
+
+Calculating the RMSE for the test set
+
+```{r}
+RMSE_base <- sqrt(sum((test_base_results$base_prediction-test_base_results$sales_per_unit)^2))
+RMSE_base
+
+```
+
+
+
+
+
+
+
+We can see that the base model explains 55% of the variance in the test set. The challenge is to develop a model that can beat that score.
+
+## Model Building
+
+The next step after the base model which is a yearly average, is to take into account seasonality. Here, time series models for each store-class combination would make sense. 
+
+However, for effective time series forecasting, we need good historical time series. However, since classes can be added and removed, it is unlikely that we will have consistent data points across store-classes combinations. Let's check this. 
+
+```{r}
+store_classes_data <- train[,.N,by=c("store_nbr","class")]
+head(store_classes_data)
+
+```
+Ideally, if a store_class has the full time series, it would have:
+```{r}
+max_days <- (365-yday(min(train$date)))+2*365+yday(max(train$date))
+max_days
+```
+
+Let's check how complete the time series are from a scale of 0 to 100%.
+```{r}
+store_classes_data$N <- store_classes_data$N/max_days*100
+hist(store_classes_data$N)
+```
+
+Since the time series at store-class level vary in length and potentially also in frequency, time series models might not work equally effective for all the store_classes combinations. 
+
+Thefore, we will have to try to integrate some time series components into regression models in order to achieve random distribution of residuals. 
+
+We will next look at using regression trees, because they can deal with both numercal and categorical variables and they don't have as many assumptions as linnear regression models. 
+
+# Model 1
+Since we have a lot of data, let's start with a light model.
+Let's add the variables that describe the time, the classes and the stores. The benefit of using regression trees is that they are picking the features most relevant. Since not all combinations of store_classes have the same amount of data, we are not going to add the store number, but instead add store features which could for example help forecast how a particular class will perform on a set of stores that has similar features. 
+
+```{r}
+#first let's transform all the categorical variables to character so that the regression trees don't see them as continous variables. Apart from years, which can be seen as ordinal categorical variables
+train$class <- as.character(train$class)
+test$class <- as.character(test$class)
+train<-train[,store_nbr:=as.character(store_nbr)]
+test$store_nbr <- as.character(test$store_nbr)
+
+model1_data <- train[,c("class","family","year","month","Lat","Long","no_items.y","transactions.y","tran_on_wknd","sales_per_unit")]
+model1_test <- test[,c("class","family","year","month","Lat","Long","no_items.y","transactions.y","tran_on_wknd","sales_per_unit")]
+
+```
+
+We will use a CART model in R: rpart
+
+```{r}
+model1 <- rpart(sales_per_unit ~ class + family + year + month + Lat + Long + no_items.y + transactions.y + tran_on_wknd, method="anova",data=model1_data)
+```
+
+
+Visualize Results:
+```{r}
+plot(model1, uniform=TRUE, main="Model1 Regression Tree")
+text(model1, use.n=TRUE,all=TRUE,cex=.8)
+```
+
+Visualizing results is not great since we have so many classes. Let's better try to see how the predictions look for this model on our test set. 
+
+```{r}
+model1_predict <- predict(model1,model1_test)
+head(model1_predict)
+model1_test$predictions <- model1_predict
+
+
+#variance explained
+VE_test <-sum((model1_test$predictions-mean_sales_per_unit)^2)
+R2_model1<-VE_test/TV_test
+R2_model1
+
+#RMSE
+RMSE_model1 <- sqrt(sum((model1_test$predictions-model1_test$sales_per_unit)^2))
+R2_model1
+RMSE_model1 
+```
+
+The first model only explains 22% of the variance. The RMSE is also lower than the base model. This could be due to the fact that the base model specifically calculates this for each store_class combination.
+
+```{r}
+rm(model1)
+rm(model1_data)
+```
+
+
+
+
+## Model 2
+
+Let's try to build a regression tree for each class. Let's test this with one class that is quite popular and one that is not so popular. 
+```{r}
+classes <- model1_data[,.N,by=class]
+classes <- classes[order(-N)]
+head(classes)
+popular<-classes[1,1]
+classes <- classes[order(N)]
+least_popular<-classes[1,1]
+popular
+least_popular
+```
+
+```{r}
+#subset data
+model2_data_p<- model1_data[class==popular]
+model2_data_lp <- model1_data[class==least_popular]
+
+model2_test_p<- model1_test[class==popular]
+model2_test_lp <- model1_test[class==least_popular]
+
+#fit the model
+model2_p <- rpart(sales_per_unit ~ class + family + year + month + Lat + Long + no_items.y + transactions.y + tran_on_wknd, method="anova",data=model2_data_p)
+model2_lp <- rpart(sales_per_unit ~ class + family + year + month + Lat + Long + no_items.y + transactions.y + tran_on_wknd, method="anova",data=model2_data_lp)
+
+#predict
+model2_predict_p <- predict(model2_p,model2_test_p)
+model2_predict_lp <- predict(model2_lp,model2_test_lp)
+
+model2_test_p$predictions <- model2_predict_p
+model2_test_lp$predictions <- model2_predict_lp
+
+#visualize
+plot(model2_p, uniform=TRUE, main="Model2 Popular Class Regression Tree")
+text(model2_p, use.n=TRUE,all=TRUE,cex=.8)
+
+plot(model2_lp, uniform=TRUE, main="Model2 Least Popular Class Regression Tree")
+text(model2_lp, use.n=TRUE,all=TRUE,cex=.8)
+
+
+```
+
+
+Performance for the popular dataset
+```{r}
+
+#variance explained
+TV_test_p <-sum((model2_test_p$sales_per_unit-mean_sales_per_unit)^2)
+VE_test_p <-sum((model2_test_p$predictions-mean_sales_per_unit)^2)
+R2_model2_p<-VE_test_p/TV_test_p
+R2_model2_p
+
+#RMSE
+RMSE_model2_p <- sqrt(sum((model2_test_p$predictions-model2_test_p$sales_per_unit)^2))
+R2_model2_p
+RMSE_model2_p 
+```
+
+Performance for the least popular dataset
+```{r}
+
+#variance explained
+TV_test_lp <-sum((model2_test_lp$sales_per_unit-mean_sales_per_unit)^2)
+VE_test_lp <-sum((model2_test_lp$predictions-mean_sales_per_unit)^2)
+R2_model2_lp<-VE_test_lp/TV_test_lp
+R2_model2_lp
+
+#RMSE
+RMSE_model2_lp <- sqrt(sum((model2_test_lp$predictions-model2_test_lp$sales_per_unit)^2))
+R2_model2_lp
+RMSE_model2_lp 
+```
+
+So it looks like the RT performs decently on the class that is popular, but it is appaling on the least popular one. Neither ones are better than the base model. 
+
+However the first split for the least populat model seems a bit strange. It says where month=abcdefgh... which cannot really be interpreted. 
+
+```{r}
+unique(model2_data_lp[,c("month","year")])
+model2_data_lp[,.N,month]
+model2_data_lp[,mean(sales_per_unit),month]
+
+
+unique(class_merged_hol_new_features$city)
+```
+
+WE can see that the model probably splits that because month=2 has the highest number of points. Perhaps instead of the month name, we should use month average temperature and precipitation. 
+Source:
+- http://www.weatherbase.com/weather/city.php3?c=EC
+The weather data is not easy to get, let's stick to the month. 
+
+```{r}
+rm(model2_test)
+rm(model2_test_lp)
+rm(model2_test_p)
+rm(model2_data)
+rm(model2_data_lp)
+rm(model2_data_p)
+rm(model2_least_popular)
+rm(model2_popular)
+rm(model2_p)
+rm(model2_lp)
+```
+
+## Model 3 
+
+Let's try adding more variables and test on the least and most popular
+
+```{r}
+model3_data <- train[,c("class","family","year","month","Lat","Long","no_items.y","transactions.y","tran_on_wknd","sales_per_unit","dcoilwtico.y","earth_fctr","nat_hol_fctr","reg_hol_fctr","loc_hol_fctr","wage_factor")]
+model3_test <- test[,c("class","family","year","month","Lat","Long","no_items.y","transactions.y","tran_on_wknd","sales_per_unit","dcoilwtico.y","earth_fctr","nat_hol_fctr","reg_hol_fctr","loc_hol_fctr","wage_factor")]
+
+
+#subset data
+model3_data_p<- model3_data[class==popular]
+model3_data_lp <- model3_data[class==least_popular]
+
+model3_test_p<- model3_test[class==popular]
+model3_test_lp <- model3_test[class==least_popular]
+
+#fit the model
+model3_p <- rpart(sales_per_unit ~ . , method="anova",data=model3_data_p)
+model3_lp <- rpart(sales_per_unit ~ ., method="anova",data=model3_data_lp)
+
+#predict
+model3_predict_p <- predict(model3_p,model3_test_p)
+model3_predict_lp <- predict(model3_lp,model3_test_lp)
+
+model3_test_p$predictions <- model3_predict_p
+model3_test_lp$predictions <- model3_predict_lp
+
+#visualize
+plot(model3_p, uniform=TRUE, main="Model2 Popular Class Regression Tree")
+text(model3_p, use.n=TRUE,all=TRUE,cex=.8)
+
+plot(model3_lp, uniform=TRUE, main="Model2 Least Popular Class Regression Tree")
+text(model3_lp, use.n=TRUE,all=TRUE,cex=.8)
+
+
+
+
+```
+
+Performance for the popular dataset
+```{r}
+
+#variance explained
+TV_test_p <-sum((model3_test_p$sales_per_unit-mean_sales_per_unit)^2)
+VE_test_p <-sum((model3_test_p$predictions-mean_sales_per_unit)^2)
+R2_model3_p<-VE_test_p/TV_test_p
+R2_model3_p
+
+#RMSE
+RMSE_model3_p <- sqrt(sum((model3_test_p$predictions-model3_test_p$sales_per_unit)^2))
+R2_model3_p
+RMSE_model3_p 
+
+```
+
+
+
+Performance for the least popular dataset
+```{r}
+
+#variance explained
+TV_test_lp <-sum((model3_test_lp$sales_per_unit-mean_sales_per_unit)^2)
+VE_test_lp <-sum((model3_test_lp$predictions-mean_sales_per_unit)^2)
+R2_model3_lp<-VE_test_lp/TV_test_lp
+R2_model3_lp
+
+#RMSE
+RMSE_model3_lp <- sqrt(sum((model3_test_lp$predictions-model3_test_lp$sales_per_unit)^2))
+R2_model3_lp
+RMSE_model3_lp 
+```
+
+```{r}
+rm(model3_test)
+rm(model3_test_lp)
+rm(model3_test_p)
+rm(model3_data)
+rm(model3_data_lp)
+rm(model3_data_p)
+rm(model3_popular)
+rm(model3_p)
+rm(model3_lp)
+```
+
+
+
+
+
+## Model 4
+
+Let's try adding the store number in and see what happens
+
+```{r}
+
+model4_data <- train[,c("class","family","year","month","store_nbr","sales_per_unit","dcoilwtico.y","earth_fctr","nat_hol_fctr","reg_hol_fctr","loc_hol_fctr","wage_factor")]
+model4_test <- test[,c("class","family","year","month","store_nbr","sales_per_unit","dcoilwtico.y","earth_fctr","nat_hol_fctr","reg_hol_fctr","loc_hol_fctr","wage_factor")]
+
+
+#subset data
+model4_data_p<- model4_data[class==popular]
+model4_data_lp <- model4_data[class==least_popular]
+
+model4_test_p<- model4_test[class==popular]
+model4_test_lp <- model4_test[class==least_popular]
+
+#fit the model
+model4_p <- rpart(sales_per_unit ~ . , method="anova",data=model4_data_p)
+model4_lp <- rpart(sales_per_unit ~ ., method="anova",data=model4_data_lp)
+
+#predict
+model4_predict_p <- predict(model4_p,model4_test_p)
+model4_predict_lp <- predict(model4_lp,model4_test_lp)
+
+model4_test_p$predictions <- model4_predict_p
+model4_test_lp$predictions <- model4_predict_lp
+
+#visualize
+plot(model4_p, uniform=TRUE, main="Model2 Popular Class Regression Tree")
+text(model4_p, use.n=TRUE,all=TRUE,cex=.8)
+
+plot(model4_lp, uniform=TRUE, main="Model2 Least Popular Class Regression Tree")
+text(model4_lp, use.n=TRUE,all=TRUE,cex=.8)
+```
+
+
+Performance for the popular dataset
+```{r}
+
+#variance explained
+TV_test_p <-sum((model4_test_p$sales_per_unit-mean_sales_per_unit)^2)
+VE_test_p <-sum((model4_test_p$predictions-mean_sales_per_unit)^2)
+R2_model4_p<-VE_test_p/TV_test_p
+R2_model4_p
+
+#RMSE
+RMSE_model4_p <- sqrt(sum((model4_test_p$predictions-model4_test_p$sales_per_unit)^2))
+R2_model4_p
+RMSE_model4_p 
+```
+
+This has beated the base model. 
+
+Performance for the least popular dataset
+```{r}
+
+#variance explained
+TV_test_lp <-sum((model4_test_lp$sales_per_unit-mean_sales_per_unit)^2)
+VE_test_lp <-sum((model4_test_lp$predictions-mean_sales_per_unit)^2)
+R2_model4_lp<-VE_test_lp/TV_test_lp
+R2_model4_lp
+
+#RMSE
+RMSE_model4_lp <- sqrt(sum((model4_test_lp$predictions-model4_test_lp$sales_per_unit)^2))
+R2_model4_lp
+RMSE_model4_lp 
+```
+
+
+
+
+Adding all the potentially important variables has not improved the predictions of the RT. 
+
+A few conclusions that can be drawn at this stage
+1) The base model is hard to beat as it creates an average at store-class level, whereas with the models we have not included the store numbers but added instead store features, which certainly seem to be important for the RT. In both popular and least popular classes, store features such as lat, long, items, transactions, tran_on_wknd are used for the splits. Obviously they are less specific that the actual store_nbr, so the predictions are less good than the base model. 
+
+
+
+## OLD CODE
+
+erestingly, the variance explained on the test set is much higher than the one on the train set. This could be because 'July and August' might be months that are much closer to the yearly average than for example December, which usually has a lot of seasonality influences. 
+Let's check if this could be the case.
+
+```{r}
+ggplot(train_base_results, aes(sales_per_unit,base_prediction)) + geom_point(aes(color = month)) + 
+  theme_bw() + labs(title="Scatterplot") +facet_wrap( ~ month)
+```
+
+Let's remove the high values for sales_per_unit which are making the visualisation not very usefl. 
+Also, sales_per_unit cannot be negative. So we will remove those for the time being for the visualization and probably replace them with 0 for the main modelling.
+
+```{r}
+viz_subset <- train_base_results[sales_per_unit<=250 & sales_per_unit>=0 & year==2016]
+ggplot(viz_subset, aes(sales_per_unit,base_prediction)) + geom_point(aes(color = month)) + 
+  theme_bw() + labs(title="Scatterplot") +facet_wrap( ~ month)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+base_model_family <- train[,mean(sales_per_unit),by=c('store_nbr','family','year')]
+names(base_model_family)[4]<-"base_prediction_family"
+head(base_model_family)
+```
+
+Let's add this to the test dataset
+
+```{r}
+test_base_results <- merge(test_base_results,base_model_family,by=c("store_nbr","family","year"),all.x=TRUE)
+head(test_base_results)
+```
+
+Replace the base_prediction with the base_prediction_familt for the new classes
+
+```{r}
+test_base_results$base_prediction_new <- coalesce(test_base_results$base_prediction,test_base_results$base_prediction_family)
+head(test_base_results)
+test_base_results$base_prediction<-test_base_results$base_prediction_new
+test_base_results$base_prediction_new<-NULL
+unique(test_base_results[is.na(base_prediction),family])
+```
+The above two families still have null values even for the family predicted values. Let's understand why. They might be launching in new stores. 
+
+
+
+```{r}
+mean_sales_per_unit<-train_base_results[,mean(sales_per_unit),]
+mean_sales_per_unit
+```
+
+
+
+From these we can see that we have quite a lot of outlier sections. Since these outliers are great indicators of how successful a section can be, we are going to leave them in for the model. However, for visualisation purposes, we are going to exclude them and also leave just the last 12 full months of data.
+
+```{r}
+max(class_merged_hol_new_features$date)
+viz_subset<- class_merged_hol_new_features[date>='2016-08-01' & date<='2017-07-01']
+viz_subset<- viz_subset[sales_per_unit<=500]
+```
+
+Check how many unique classes and unique families we have so that we know what we can visualize
+```{r}
+length(unique(class_merged_hol_new_features$class))
+length(unique(class_merged_hol_new_features$family))
+```
+
+334 is a high  number of categories to visualize, so let's just use the family for now. 
+
+## Visualising Continous Variables
+
+In order to have an idea about which variables might be correlated with our target variable, let's calculate the correlation matrix.
+
+```{r}
+cor_data<-viz_subset[,c("sales_per_unit","items_on_promotion","no_perishable_items","wage_factor","nat_hol_fctr","dcoilwtico.y")]
+```
+
+
+
+### 1) Sales Per Unit and Items on Promotion
+
+```{r}
+ggplot(viz_subset, aes(items_onpromotion,sales_per_unit)) + geom_point(aes(color = family)) + 
+  theme_bw() + labs(title="Scatterplot") +facet_wrap( ~ family)
+```
+
+It does look like items on promotion has different impact on differect categories, so it could be a relevant feature to include. Let' check it's correlation coefficient:
+```{r}
+cor(viz_subset$sales_per_unit,viz_subset$items_onpromotion)
+```
+
+
+
+
+Save the results so far:
+```{r}
+write.csv(class_merged_hol_new_features,"class_merged_all_features.csv")
+```
+
+
+
+Since we are dealing with a lot of data, I will build the model in a step-wise fashion.
+
+The aim of the regression is to try to predict the sales performance (sales_per_unit) for each class_combination_store
