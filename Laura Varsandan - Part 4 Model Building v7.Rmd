@@ -1,0 +1,939 @@
+---
+title: "Laura Varsandan Part 4 Model Building"
+output: 
+  html_document: 
+       smart: false
+---
+
+Loading Libraries
+
+```{r}
+library(data.table)
+library(ggplot2)  
+library(dplyr)
+library(lubridate)
+library(rpart)
+library(smooth)
+library(forecast)
+library(tree)
+library(GGally)
+```
+
+Loading in the data as saved at the end of Part 4 EDA which contains all the features.
+
+```{r}
+class_merged_all_features<-fread('class_merged_all_features.csv')
+head(class_merged_all_features)
+```
+
+Let's make sure that all the categorical data and dates have the appropiate data type and that there are no duplicate rows as a result of the merging of datasets. 
+```{r}
+# deduplicate
+class_merged_all_features <- unique(class_merged_all_features)
+class_merged_all_features$V1 <- NULL
+
+#change the data types
+class_merged_all_features <- class_merged_all_features[,store_nbr:=as.character(store_nbr)]
+class_merged_all_features <- class_merged_all_features[,class:=as.character(class)]
+class_merged_all_features <- class_merged_all_features[,date:=as.Date(date)]
+head(class_merged_all_features)
+```
+
+
+## Train and Test sets
+Since July 2017 is the last full month we have information on, we will use that one as a test set. Since these decisions probably need to be made the month before, we will use our train set up to May 2016, as this prediction exercise is likely to happen during June 2017. The scope of this analysis only includes predicting results for July 2017 and therefore the performance of the model will only be assessed on the July 2017 data. Limitations of this approach will be discussed in the reflections section.
+
+Whilst we will try to build a generalizable prediction model that can be applyed for all months, this is would have to be revisited each month in order to make sure it still performs as well as it should be. 
+
+
+
+```{r}
+train <- class_merged_all_features[date<='2017-05-31']
+test <- class_merged_all_features[date>'2017-06-30' & date<='2017-07-31']
+nrow(train)
+nrow(test)
+```
+
+
+
+
+## Base Model
+
+As a base model, we are going to use the simple average sales per unit for each store-class-year combination. 
+
+```{r}
+base_model <- train[,mean(sales_per_unit),by=c('store_nbr','class','year')]
+names(base_model)[4]<-"base_prediction"
+head(base_model)
+```
+
+Let's add this to the test dataset
+
+```{r}
+test <- merge(test,base_model,by=c("store_nbr","class","year"),all.x=TRUE)
+head(test)
+```
+
+We need to remove the lines for which we have no prediction. This is due to new sections being added to stores. Forecasting performance of new sections in new stores is a separate problem and the decisino of which classes to introduce to each store should be secondary after a decision has been made for how big a section should be in a particular store. 
+
+```{r}
+test <- test[!is.na(test$base_prediction),]
+head(test)
+hist(test$base_prediction)
+```
+
+
+### Base Model Evaluation
+We are going to evaluate our models on two measures: the % of variance explained which will give us an idea of how much more is left to improve after each model and RMSE which will give us an idea of ecavtly how far are are point-wise predictions from the actuals. 
+
+Let's calculate these two measures for the base model. 
+
+```{r}
+#variance explained
+mean_test_sales_per_unit <- test[,mean(sales_per_unit)]
+TV <- sum((test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_base <- sum((test$base_prediction-mean_test_sales_per_unit)^2)
+R2_base<-VE_base/TV
+R2_base
+
+#RMSE
+RMSE_base<- sqrt(sum((test$base_prediction-test$sales_per_unit)^2)/nrow(test))
+RMSE_base 
+```
+
+Before we start, we need to make sure that the train and test table has the right order
+
+```{r}
+head(test[order(class,store_nbr,date)])
+test <- test[order(class,store_nbr,date)]
+train <- train[order(class,store_nbr,date)]
+head(test)
+head(train)
+```
+
+
+
+## Model 1: Simple Moving Average
+
+Let's try a simple moving average model for each store-class combination and see how much better that is compared to the base model. Moving average models are generally good for giving trends, but they might perform well for some classes and less well for others.
+
+Since there are different data points that might stop and start at different times and since we want to forecast daily for the month ahead, we will set a moving average period between 2 and 30 days,depending on how much data we have for each store-class combination.
+
+Since we want several iterations of moving average for our dataset because we are trying to predict several periods in advance, let's at least have 3 iterations of the moving average. So the n will be equal to the integer of the total number of datapoints for each store-class divided by 3. 
+
+Let's just check what is our largest and smallest time series for a store-class combination. 
+
+```{r}
+store_class <- train[,.N,by=c("store_nbr","class")]
+store_class <- store_class[order(N)]
+head(store_class)
+store_class <- store_class[order(-N)]
+head(store_class)
+```
+
+So we can see that the highest number of data points for a store_class is 1126 and the lowest number of data points is 1. 
+
+Let's also check the distribution
+
+```{r}
+hist(store_class$N)
+```
+
+We can see that for the majority of points we have more than 1 point, which is good. 
+
+For the store-class combinations that have between 1 and 5 points, we will use n=1 as that will allow for some iterations of the forecast. For what is between 6 and 8, we will use 2 points as that will allow at least 3 iterations of the MA. For everything above 9, we will divide by 3 to get the n, and once we get over 30 datapoints, we use p=10. We need to strike a balance between monthly trends and daily forecast. 
+
+Creating the stores and classes vectors
+```{r}
+stores <- unique(test$store_nbr)
+classes <- unique(test$class)
+
+```
+
+
+```{r}
+# for (c in 1:length(classes)){
+#   for (s in 1:length(stores)) {
+#     data_points <- store_class[store_nbr==stores[s] & class==class[c],N]
+#     if (data_points<=5){
+#       p<-1
+#     } else if (data_points<=8) {
+#       p<-2
+#     } else if (data_points<30) {
+#       p<-3
+#     } else p<-10
+#     p
+#     ts <- train[store_nbr==stores[s] & class==class[c],c("store_nbr","class","date","sales_per_unit")]
+#     ts_test <- test[store_nbr==stores[s] & class==class[c],c("store_nbr","class","date","sales_per_unit")]
+#     head(ts)
+#     sma <- sma(ts$sales_per_unit,n=p)
+#     sma_predictions <- forecast(sma,nrow(ts_test))
+#     ts_test$predictions <- sma_predictions$forecast
+#     # for the first iteration create a data.table with the results, 
+#     # for the rest of the iterations append the results to the first data table. 
+#     if (c==1 & s==1) {
+#       sma_model1_results <- ts_test
+#     } else sma_model1_results <- rbind(sma_model1_results,ts_test)
+#   }
+# }
+  
+    
+```
+
+The for loop to create a time series forecast for each store-class is taking too much time. This is because it has to run 318x54=17,172 loops. In 9 hours, it produced results for 24% of the test set. Let's check the quality of these forecasts
+
+```{r}
+test_sma_results <- merge(test, sma_model1_results, by=c("store_nbr","class","date"),all.y=TRUE)
+#save them
+#write.csv(test_sma_results,"test_sma_results.csv")
+test_sma_results <- test_sma_results[!is.na(test_sma_results$predictions),]
+test_sma_results <- test_sma_results[!is.na(test_sma_results$sales_per_unit.y),]
+head(test_sma_results)
+test_sma_results$predictions <- as.numeric(test_sma_results$predictions)
+
+
+#variance explained
+mean_test_sales_per_unit <- test[,mean(sales_per_unit)]
+TV_model1 <- sum((test_sma_results$sales_per_unit.y-mean_test_sales_per_unit)^2)
+VE_model1 <- sum((test_sma_results$predictions-mean_test_sales_per_unit)^2)
+R2_model1<-VE_model1/TV
+R2_model1
+
+#RMSE
+RMSE_model1<- sqrt(sum((test_sma_results$predictions-test_sma_results$sales_per_unit.y)^2)/nrow(test_sma_results))
+RMSE_model1 
+
+
+
+```
+
+So for 24% of the dataset, a SMA algorithm explains 95.5% of the variance and has a RMSE of 1.206, both metrics are much better than the base model. Therefore, with a powerful computer, exploring the route of time series algorithms or even other algorithms at a store-class level would be the best alternative in terms fo prediction accuracy. 
+
+However, since I don't have such a powerful computers, I will look at less computationally complex methods of forecasting the sales_per_unit. There are two main options:
+
+1) Maintain the current granularity level of the forecasts at class-store, but implement algorithms either at a dataset level, or per each class or per each store.
+2) Reduce the granularity level to class-cluster so that we have less possible combinations. This might not have an undersired effect as most supermarket chains tend to group their stores into operational clusters and we might have to do this at an optimisation stage. However, this might lose the detail of extraorginarily good performing sections in certain stores as the results get more generalized over clusters. 
+
+We will explore the first option now and see what kind of results we can achieve.
+
+## Model 2: Regression Trees on a dataset level
+
+We will next look at using regression trees, because they can deal with both numercal and categorical variables and they don't have as many assumptions as linnear regression models. Another benefit of regression trees is the automatical feature selection that it does when building a tree, which only leaves the relevant features. 
+
+a) Let's add all the relevant features without the store_nbr, but with all the features that describe the stores. 
+
+```{r}
+RT1_train <- train[,c("class","family","year","month","Lat","Long","no_items.y","transactions.y","tran_on_wknd","sales_per_unit","dcoilwtico.y","earth_fctr","nat_hol_fctr","reg_hol_fctr","loc_hol_fctr","wage_factor")]
+RT1_test <- test[,c("class","family","year","month","Lat","Long","no_items.y","transactions.y","tran_on_wknd","sales_per_unit","dcoilwtico.y","earth_fctr","nat_hol_fctr","reg_hol_fctr","loc_hol_fctr","wage_factor")]
+```
+
+Fit the model
+
+```{r}
+RT1 <- rpart(sales_per_unit ~ . , method="anova",data=RT1_train)
+```
+
+Predict for the test set
+
+```{r}
+RT1_predictions <- predict(RT1,RT1_test)
+```
+
+Save the predictions
+
+```{r}
+RT1_test$RT1_predictions <- RT1_predictions
+head(RT1_test)
+```
+
+Visualize the model
+
+```{r}
+plot(RT1, uniform=TRUE, main="Model2 Regression Tree with all relevant features")
+text(RT1, use.n=TRUE,all=TRUE,cex=.8)
+```
+
+We can see that the tree splits are mainly driven by the classes, which makes it difficult to vizualise.
+
+Let's see how the model performs. 
+
+```{r}
+
+#variance explained
+mean_test_sales_per_unit <- test[,mean(sales_per_unit)]
+TV_model2 <- sum((test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_model2 <- sum((RT1_test$RT1_predictions-mean_test_sales_per_unit)^2)
+R2_model2<-VE_model2/TV_model2
+R2_model2
+
+#RMSE
+RMSE_model2<- sqrt(sum((RT1_test$RT1_predictions-RT1_test$sales_per_unit)^2)/nrow(RT1_test))
+RMSE_model2 
+```
+
+Clean up the work space:
+```{r}
+rm(RT1)
+rm(RT1_test)
+rm(RT1_train)
+```
+
+
+
+
+This is a worse performance than our base model. This makes sense as our base model calculates an average per class-store-year, which takes into account 3 key dimensions: class type, store type and the time period. 
+
+## Model 3: Building a set of regression trees
+
+Let's try to build the simplest regression tree first, and then build extra regression trees on the residuals. We will use the package 'tree' instead of randomforest because randomForest will add additional complexity.
+
+### Model 3a - Regression tree on the family for each class. 
+
+```{r}
+RT_train <- train[,c("class","family","year","month","Lat","Long","no_items.y","transactions.y","tran_on_wknd","sales_per_unit","dcoilwtico.y","earth_fctr","nat_hol_fctr","reg_hol_fctr","loc_hol_fctr","wage_factor")]
+RT_test <- test[,c("class","family","year","month","Lat","Long","no_items.y","transactions.y","tran_on_wknd","sales_per_unit","dcoilwtico.y","earth_fctr","nat_hol_fctr","reg_hol_fctr","loc_hol_fctr","wage_factor")]
+
+RT_train <- RT_train[,family:=as.factor(family)]
+length(unique(RT_train$family))
+
+```
+
+Since a tree can only deal with 32 levels of a factor at most, we can either merge two families or build two trees, one for 16 families and one for 17 families.Let's see what kind of families we have to see if we can merge them:
+
+```{r}
+class_family <- unique(RT_train[,c("family","class")])
+class_family <- aggregate(class ~ family, data=class_family, FUN=length)
+class_family <- class_family[order(class_family$class),]
+class_family
+```
+Since Grocey || only has one class, let's merge that one with Grocery |.
+
+```{r}
+RT_train <- RT_train[family=="GROCERY II",family:="GROCERY I"]
+RT_test <- RT_test[family=="GROCERY II",family:="GROCERY I"]
+
+RT_train <- RT_train[,family:=as.factor(as.character(family))]
+RT_test <- RT_test[,family:=as.factor(as.character(family))]
+
+```
+
+Let's look at the values of our target variable:
+
+
+```{r}
+boxplot(RT_test$sales_per_unit)
+```
+
+It looks like it needs a log transformation [explain in more detail why]
+
+```{r}
+RT_train <- RT_train[,log_sales_per_unit:=log(sales_per_unit)]
+RT_test <- RT_test[,log_sales_per_unit:=log(sales_per_unit)]
+```
+
+Remove the NaNs and Infinite Values from the log transformations
+
+```{r}
+RT_train <- RT_train[!is.nan(log_sales_per_unit)]
+RT_test <- RT_test[!is.nan(log_sales_per_unit)]
+
+# check
+table(is.finite(RT_train$log_sales_per_unit))
+
+# remove the infinite values
+RT_train <- RT_train[is.finite(log_sales_per_unit)]
+RT_test <- RT_test[is.finite(log_sales_per_unit)]
+```
+
+
+Let's vizualise the results now:
+
+```{r}
+boxplot(RT_test$log_sales_per_unit)
+```
+
+
+Fit the model
+
+
+```{r}
+RT2 <- tree(log_sales_per_unit ~ family ,data=RT_train, mindev=0.0001)
+summary(RT2)
+```
+
+Predict for the test set
+
+```{r}
+RT2_predictions <- predict(RT2,RT_test)
+```
+
+Save the predictions
+
+```{r}
+RT_test$RT2_predictions <- exp(RT2_predictions)
+head(RT_test)
+```
+Visualize the model
+
+```{r}
+plot(RT2, main="Model3 Regression Tree on the Family")
+text(RT2,cex=.8,pretty=FALSE)
+```
+
+We can see that this model only has one split, which is not ideal and it's performance is probably very bad.
+```{r}
+
+#variance explained
+mean_test_sales_per_unit <- RT_test[,mean(sales_per_unit)]
+TV_model3 <- sum((RT_test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_model3 <- sum((RT_test$RT2_predictions-mean_test_sales_per_unit)^2)
+R2_model3<-VE_model3/TV_model3
+R2_model3
+
+#RMSE
+RMSE_model3<- sqrt(sum((RT_test$RT2_predictions-RT_test$sales_per_unit)^2)/nrow(RT_test))
+RMSE_model3 
+```
+
+This has the best performance so far for the RT based on family. 
+
+### Model 3b :Regression tree with store features added
+
+Let's see how much more improvement we gain if we add the store features to the RT
+
+Fit the model
+
+```{r}
+RT2 <- tree(log_sales_per_unit ~ family + Lat + Long + no_items.y + transactions.y + tran_on_wknd,data=RT_train, mindev=0.0001)
+summary(RT2)
+```
+
+Predict for the test set
+
+```{r}
+RT2_predictions <- predict(RT2,RT_test)
+```
+
+Save the predictions
+
+```{r}
+RT_test$RT2_predictions <- exp(RT2_predictions)
+head(RT_test)
+```
+
+Visualize the model
+
+```{r}
+plot(RT2, main="Model3 Regression Tree on the Class")
+text(RT2, cex=.8, pretty=FALSE)
+```
+
+At least we now have more splits. 
+
+```{r}
+#variance explained
+mean_test_sales_per_unit <- RT_test[,mean(sales_per_unit)]
+TV_model3 <- sum((RT_test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_model3 <- sum((RT_test$RT2_predictions-mean_test_sales_per_unit)^2)
+R2_model3<-VE_model3/TV_model3
+R2_model3
+
+#RMSE
+RMSE_model3<- sqrt(sum((RT_test$RT2_predictions-RT_test$sales_per_unit)^2)/nrow(RT_test))
+RMSE_model3 
+```
+
+
+
+### Model 3c: Regression tree with store features and time features
+
+```{r}
+RT_train <- RT_train[,year:=as.factor(year)]
+RT_train <- RT_train[,month:=as.factor(month)]
+RT_test <- RT_test[,year:=as.factor(year)]
+RT_test <- RT_test[,month:=as.factor(month)]
+```
+
+Fit the model
+
+```{r}
+RT2 <- tree(log_sales_per_unit ~ family + transactions.y + month,data=RT_train, mindev=0.0001)
+summary(RT2)
+```
+
+
+
+Predict for the test set
+
+```{r}
+RT2_predictions <- predict(RT2,RT_test)
+```
+
+Save the predictions
+
+```{r}
+RT_test$RT2_predictions <- exp(RT2_predictions)
+head(RT_test)
+```
+
+Visualize the model
+
+```{r}
+plot(RT2, main="Model3 Regression Tree on the Class")
+text(RT2, cex=.8, pretty=FALSE)
+```
+
+
+
+```{r}
+#variance explained
+mean_test_sales_per_unit <- RT_test[,mean(sales_per_unit)]
+TV_model3 <- sum((RT_test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_model3 <- sum((RT_test$RT2_predictions-mean_test_sales_per_unit)^2)
+R2_model3<-VE_model3/TV_model3
+R2_model3
+
+#RMSE
+RMSE_model3<- sqrt(sum((RT_test$RT2_predictions-RT_test$sales_per_unit)^2)/nrow(RT_test))
+RMSE_model3 
+```
+
+Fit the model
+
+```{r}
+RT2 <- tree(log_sales_per_unit ~ family + transactions.y + tran_on_wknd + month + nat_hol_fctr + wage_factor,data=RT_train, mindev=0.0001)
+summary(RT2)
+```
+
+Predict for the test set
+
+```{r}
+RT2_predictions <- predict(RT2,RT_test)
+```
+
+Save the predictions
+
+```{r}
+RT_test$RT2_predictions <- exp(RT2_predictions)
+head(RT_test)
+```
+
+
+Visualize the model
+
+```{r}
+plot(RT2, main="Model3 Regression Tree on the Class")
+text(RT2, cex=.8, pretty=FALSE)
+```
+
+
+```{r}
+#variance explained
+mean_test_sales_per_unit <- RT_test[,mean(sales_per_unit)]
+TV_model3 <- sum((RT_test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_model3 <- sum((RT_test$RT2_predictions-mean_test_sales_per_unit)^2)
+R2_model3<-VE_model3/TV_model3
+R2_model3
+
+#RMSE
+RMSE_model3<- sqrt(sum((RT_test$RT2_predictions-RT_test$sales_per_unit)^2)/nrow(RT_test))
+RMSE_model3 
+```
+
+Create the new target variable: RT2_residuals
+
+```{r}
+RT_test$RT2_residuals <- RT_test$RT2_predictions-RT_test$sales_per_unit
+RT_train$RT2_residuals <- RT_train$RT2_predictions-RT_train$sales_per_unit
+
+hist(RT_test$RT2_residuals)
+hist(RT_train$RT2_residuals)
+
+```
+
+## Exclude
+Let's now build the regression model on the residuals
+
+```{r}
+RT3 <- tree(RT2_residuals ~ year + month + wage_factor + nat_hol_fctr + reg_hol_fctr + loc_hol_fctr + dcoilwtico.y,data=RT_train, mindev=0.00001)
+summary(RT3)
+```
+
+Visualize the model
+
+```{r}
+plot(RT3, main="Model3 Regression Tree on the Class")
+text(RT3, cex=.8, pretty=FALSE)
+```
+
+
+Predict for the test set
+
+```{r}
+RT3_predictions <- predict(RT3,RT_test)
+```
+
+Save the predictions
+
+```{r}
+RT_test$RT3_predictions <- RT3_predictions
+RT_test$RT3_predictions <- RT_test$RT3_predictions + RT_test$RT2_predictions
+head(RT_test)
+```
+
+```{r}
+
+#variance explained
+mean_test_sales_per_unit <- test[,mean(sales_per_unit)]
+TV_model3 <- sum((test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_model3 <- sum((RT_test$RT3_predictions-mean_test_sales_per_unit)^2)
+R2_model3<-VE_model3/TV_model3
+R2_model3
+
+#RMSE
+RMSE_model3<- sqrt(sum((RT_test$RT3_predictions-RT_test$sales_per_unit)^2)/nrow(RT_test))
+RMSE_model3 
+```
+
+
+
+### Model 3d: Let's try to build a model again on sales_per_unit, using only the most relevant features as picked from the regression trees above
+
+Out of the store features, transactions.y and tran_on_wknd seemed to have been the most important ones. 
+Out of the time features, the month, year, wage_factor and nat_hol_factor seemed to have been the most important ones
+
+```{r}
+RT2 <- tree(log_sales_per_unit ~ family + transactions.y + tran_on_wknd + month + year + nat_hol_fctr + wage_factor,data=RT_train, mindev=0.00001)
+summary(RT2)
+```
+
+Visualize the model
+
+```{r}
+plot(RT2, main="Model3 Regression Tree on the Class")
+text(RT2, cex=.8, pretty=FALSE)
+```
+
+Predict for the test set
+
+```{r}
+RT2_predictions <- predict(RT2,RT_test)
+```
+
+Save the predictions
+
+```{r}
+RT_test$RT2_predictions <- RT2_predictions
+head(RT_test)
+```
+
+
+```{r}
+
+#variance explained
+mean_test_sales_per_unit <- test[,mean(sales_per_unit)]
+TV_model3 <- sum((test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_model3 <- sum((RT_test$RT2_predictions-mean_test_sales_per_unit)^2)
+R2_model3<-VE_model3/TV_model3
+R2_model3
+
+#RMSE
+RMSE_model3<- sqrt(sum((RT_test$RT2_predictions-RT_test$sales_per_unit)^2)/nrow(RT_test))
+RMSE_model3 
+```
+
+```{r}
+write.csv(RT_train,"RT_train.csv")
+write.csv(RT_test,"RT_test.csv")
+
+```
+
+```{r}
+rm(RT_test)
+rm(RT_train)
+rm(RT2)
+rm(RT2_test)
+rm(RT2_train)
+rm(RT3)
+```
+
+
+This is the best model built on the target variable sales_per_unit and it still only explains 7% of variace and has am RMSE of 10.95. These are very poor results compared to the base model which had 56.69% of variance explained and and RMSE of 7.94. 
+
+The performance of the base model is hard to beat because it takes an average for all three important dimensions that we are interested in. 
+
+Therefore, let's see if we can improve on it. Let's calculate the base model predictions for all months from 2015 to 2017 and then apply a regression tree model on the residuals. 
+
+```{r}
+month_year <- unique(train[date>='2015-01-01',c("month_year")])
+month_year <-month_year$month_year
+month_year
+
+```
+
+```{r}
+for (i in 1:length(month_year)){
+      m=month_year[i]
+      max_date <- train[month_year==m,max(date)]
+      d <- max_date - 60 #include data only until when you would start doing the prediction
+      head(train[date<=max_date])
+      base_data <- train[date<=d & year>=year(max_date)-1]
+      unique(base_data$month_year)
+      train_bm <- base_data[,mean(sales_per_unit),by=c('store_nbr','class','year')]
+      names(train_bm)[4]<-"base_prediction"
+      if (month(max_date) %in% c(1,2)) {
+        train_bm_new <- train_bm[year==year(max_date)-1]
+        train_bm_new$year <- year(max_date)
+      } else  train_bm_new <- train_bm
+      month_year_pred <- train[month_year==m]
+      month_year_pred <- merge(month_year_pred,train_bm_new, by=c("store_nbr","class","year"),all.x=TRUE)
+      #remove nulls
+      month_year_pred <- month_year_pred[!is.na(base_prediction)]
+      #store the data
+      if (i==1){
+          train_base_results <- month_year_pred
+      } else train_base_results <- rbind(train_base_results,month_year_pred)
+}
+```
+
+Let's see how the model performs on the train dataset
+
+Since we removed some rows when they were new additions, let's see what % of data we kept
+
+
+```{r}
+train_base_results <- fread("train_base_results.csv")
+nrow(train_base_results)/nrow(train)
+```
+
+We still kept the majority of lines, which means that we can use the results
+
+```{r}
+#variance explained
+mean_train_sales_per_unit <- train[,mean(sales_per_unit)]
+TV_train <- sum((train_base_results$sales_per_unit-mean_train_sales_per_unit)^2)
+VE_train_base <- sum((train_base_results$base_prediction-mean_train_sales_per_unit)^2)
+R2_train_base<-VE_train_base/TV_train
+R2_train_base
+
+#RMSE
+RMSE_train_base<- sqrt(sum((train_base_results$base_prediction-train_base_results$sales_per_unit)^2)/nrow(train_base_results))
+RMSE_train_base 
+```
+
+Let's add the new target variable: the residuals from the base model:
+
+```{r}
+test$base_residuals <- test$sales_per_unit - test$base_prediction
+#train_base_results$base_residuals <- train_base_results$sales_per_unit- train_base_results$base_prediction
+train_base_results <- train_base_results[,base_residuals:=sales_per_unit-base_prediction]
+head(train_base_results)
+```
+Let's visualize the distributions
+ 
+```{r}
+boxplot(train_base_results$base_residuals)
+```
+
+Again it looks like the target variable needs a log tranformation to improve the variance. However, we have negative values, so we will have to adjust the transformation by adding a constant that will make the smallest value of base_residuals positive. We will set the same constant for both the train and test. 
+
+```{r}
+train_base_results[,min(base_residuals)]
+test[,min(base_residuals)]
+```
+
+Let's therefore set the constant a=865 so that a+min(train$base_residual). 
+
+```{r}
+a=865
+train_base_results <- train_base_results[,base_residuals_tran:=base_residuals+a]
+test <- test[,base_residuals_tran:=base_residuals+a]
+
+# take the log of the transformed
+
+train_base_results <- train_base_results[,base_residuals_log:=log(base_residuals_tran)]
+test <- test[,base_residuals_log:=log(base_residuals_tran)]
+
+```
+
+Let's see how the distribution looks:
+
+```{r}
+boxplot(train_base_results$base_residuals_log)
+```
+
+
+
+
+## Model 4: RT with all other features except class and store.
+
+First let's add all the factors needed: month, weekdays. 
+
+```{r}
+train_base_results <- train_base_results[,month:=as.factor(month)]
+test <- test[,month:=as.factor(month)]
+train_base_results <- train_base_results[,date:=as.Date(date)]
+train_base_results <- train_base_results[,dow:=as.factor(weekdays(date))]
+test <- test[,dow:=as.factor(weekdays(date))]
+test <- test[,day_of_month:=as.factor(day_of_month)]
+train_base_results <- train_base_results[,day_of_month:=as.factor(day_of_month)]
+train_base_results <- train_base_results[family=="GROCERY II",family:="GROCERY I"]
+test <- test[family=="GROCERY II",family:="GROCERY I"]
+
+#is_weekday
+unique(test$is_weekday)
+unique(train_base_results$is_weekday)
+train_base_results <- train_base_results[dow %in% c("Monday","Tuesday","Wednesday","Thursday","Friday"),is_weekday:="1"]
+train_base_results <- train_base_results[dow %in% c("Saturday","Sunday"),is_weekday:="0"]
+train_base_results <- train_base_results[,is_weekday:=as.factor(is_weekday)]
+test <- test[dow %in% c("Monday","Tuesday","Wednesday","Thursday","Friday"),is_weekday:="1"]
+test <- test[dow %in% c("Saturday","Sunday"),is_weekday:="0"]
+test <- test[,is_weekday:=as.factor(is_weekday)]
+
+#perc_on_prom
+train_base_results <- train_base_results[,perc_on_prom:=items_onpromotion/no_items.x]
+test <- test[,perc_on_prom:=items_onpromotion/no_items.x]
+
+
+head(train_base_results)
+head(test)
+
+boxplot(train_base_results$perc_on_prom)
+
+```
+
+
+
+Fit the model with time dimensions as the base model already takes into account the store and class characteristics.
+
+```{r}
+RT4 <- tree(base_residuals_log ~ month + dow + nat_hol_fctr + perc_on_prom, data=train_base_results, mindev=0.001)
+summary(RT4)
+```
+
+
+Visualize the model
+
+```{r}
+plot(RT4, main="Model3 Regression Tree on the Class")
+text(RT4, cex=.8, pretty=FALSE)
+```
+Predict for the test set
+
+```{r}
+RT4_predictions <- predict(RT4,test)
+```
+
+Save the predictions
+
+```{r}
+#train_base_results$RT4_predictions <- predict(RT4,train_base_results)
+test$RT4_predictions <- exp(RT4_predictions)-a
+test <- test[,RT4_predictions:=base_prediction+RT4_predictions]
+head(test)
+```
+
+
+```{r}
+
+#variance explained
+mean_test_sales_per_unit <- test[,mean(sales_per_unit)]
+TV_model4 <- sum((test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_model4 <- sum((test$RT4_predictions-mean_test_sales_per_unit)^2)
+R2_model4<-VE_model4/TV_model4
+R2_model4
+
+#RMSE
+RMSE_model4<- sqrt(sum((test$RT4_predictions-test$sales_per_unit)^2)/nrow(test))
+RMSE_model4 
+```
+
+```{r}
+write.csv(test,"test.csv")
+```
+
+
+
+#### Visualisation of model results 
+
+```{r}
+ggplot(test, aes(log(RT4_predictions),log(sales_per_unit))) + geom_point(aes(color = family)) + 
+  theme_bw() + labs(title="Scatterplot") +facet_wrap( ~ family)
+
+```
+We can see that most of the families display similar pattern of over estimation, with the exception of Automative. Let's add the family to the RT and see what happens.
+
+Let's see how the predictions vary depending on the stores.
+
+```{r}
+ggplot(test, aes(log(RT4_predictions),log(sales_per_unit))) + geom_point(aes(color = store_nbr)) + 
+  theme_bw() + labs(title="Scatterplot") +facet_wrap( ~ store_nbr)
+```
+
+We can see similar trend as for the families sections. Except, store 3 and 5 have some clear outliers. 
+
+Let's look at the day of the month. 
+
+
+```{r}
+ggplot(test, aes(log(RT4_predictions),log(sales_per_unit))) + geom_point(aes(color = day_of_month)) + 
+  theme_bw() + labs(title="Scatterplot") +facet_wrap( ~ day_of_month)
+```
+
+With this the graphs vary a lot more and there are some interesting patterns. Let's try day of week
+
+
+```{r}
+ggplot(test, aes(log(RT4_predictions),log(sales_per_unit))) + geom_point(aes(color = dow)) + 
+  theme_bw() + labs(title="Scatterplot") +facet_wrap( ~ dow)
+```
+
+
+Clear distinct patterns between the different week days. Let's try and replace day of week with a wage_factor. Let's replace the dow with an is_weekend_factor and see how it behaves. Now all the graphs during the weekdays look more similar. 
+
+
+Let's see how the numerical factors on the test set correlate with our target variable. 
+
+```{r}
+numerical <- test[,c("sales_per_unit","RT4_predictions","wage_factor","nat_hol_fctr","reg_hol_fctr","items_onpromotion","no_perishable_items","dcoilwtico.y","tran_on_wknd")]
+
+ggpairs(numerical)
+
+```
+
+
+No other continous variable is strongly correlated with sales per unit. 
+
+Let's investigate where the residuals lie. 
+
+```{r}
+test <- test[,RT4_residuals:=sales_per_unit-RT4_predictions]
+write.csv(test,"best_model_test_results.csv")
+
+head(test)
+
+```
+
+
+```{r}
+avg_rez <- test[,mean(RT4_residuals),by=c("family","dow")]
+names(avg_rez)[3] <- "average_residual"
+```
+
+```{r}
+ggplot(avg_rez, aes(dow, family)) + geom_tile(aes(fill = average_residual) , colour = "white") + scale_fill_gradient2(low = "red", midpoint= 0, high = "steelblue")
+```                                               
+
+Let's take a subset of the families with the highest residuals
+
+```{r}
+subset_families <- unique(avg_rez[average_residual>5 | average_residual<5,"family"])
+subset_families
+```
+
+All of them. 
+
+Let's vizualize family by day of month - no particular trends
+
+
+
