@@ -1,0 +1,186 @@
+---
+title: "Laura Varsandan Part 4 Model Building"
+output: 
+  html_document: 
+       smart: false
+---
+
+Loading Libraries
+
+```{r}
+library(data.table)
+library(ggplot2)  
+library(dplyr)
+library(lubridate)
+library(rpart)
+library(smooth)
+library(forecast)
+```
+
+Loading in the data as saved at the end of Part 4 EDA which contains all the features.
+
+```{r}
+class_merged_all_features<-fread('class_merged_all_features.csv')
+head(class_merged_all_features)
+```
+
+Let's make sure that all the categorical data and dates have the appropiate data type and that there are no duplicate rows as a result of the merging of datasets. 
+```{r}
+# deduplicate
+class_merged_all_features <- unique(class_merged_all_features)
+class_merged_all_features$V1 <- NULL
+
+#change the data types
+class_merged_all_features <- class_merged_all_features[,store_nbr:=as.character(store_nbr)]
+class_merged_all_features <- class_merged_all_features[,class:=as.character(class)]
+class_merged_all_features <- class_merged_all_features[,date:=as.Date(date)]
+head(class_merged_all_features)
+```
+
+
+## Train and Test sets
+Since July 2017 is the last full month we have information on, we will use that one as a test set. Since these decisions probably need to be made the month before, we will use our train set up to May 2016, as this prediction exercise is likely to happen during June 2017. The scope of this analysis only includes predicting results for July 2017 and therefore the performance of the model will only be assessed on the July 2017 data. Limitations of this approach will be discussed in the reflections section.
+
+Whilst we will try to build a generalizable prediction model that can be applyed for all months, this is would have to be revisited each month in order to make sure it still performs as well as it should be. 
+
+
+
+```{r}
+train <- class_merged_all_features[date<='2017-05-01']
+test <- class_merged_all_features[date>'2017-06-30' & date<='2017-07-31']
+nrow(train)
+nrow(test)
+```
+
+
+
+
+## Base Model
+
+As a base model, we are going to use the simple average sales per unit for each store-class-year combination. 
+
+```{r}
+base_model <- train[,mean(sales_per_unit),by=c('store_nbr','class','year')]
+names(base_model)[4]<-"base_prediction"
+head(base_model)
+```
+
+Let's add this to the test dataset
+
+```{r}
+test <- merge(test,base_model,by=c("store_nbr","class","year"),all.x=TRUE)
+head(test)
+```
+
+We need to remove the lines for which we have no prediction. This is due to new sections being added to stores. Forecasting performance of new sections in new stores is a separate problem and the decisino of which classes to introduce to each store should be secondary after a decision has been made for how big a section should be in a particular store. 
+
+```{r}
+test <- test[!is.na(test$base_prediction),]
+head(test)
+hist(test$base_prediction)
+```
+
+
+### Base Model Evaluation
+We are going to evaluate our models on two measures: the % of variance explained which will give us an idea of how much more is left to improve after each model and RMSE which will give us an idea of ecavtly how far are are point-wise predictions from the actuals. 
+
+Let's calculate these two measures for the base model. 
+
+```{r}
+#variance explained
+mean_test_sales_per_unit <- test[,mean(sales_per_unit)]
+TV <- sum((test$sales_per_unit-mean_test_sales_per_unit)^2)
+VE_base <- sum((test$base_prediction-mean_test_sales_per_unit)^2)
+R2_base<-VE_base/TV
+R2_base
+
+#RMSE
+RMSE_base<- sqrt(sum((test$base_prediction-test$sales_per_unit)^2)/nrow(test))
+RMSE_base 
+```
+
+Before we start, we need to make sure that the train and test table has the right order
+
+```{r}
+head(test[order(class,store_nbr,date)])
+test <- test[order(class,store_nbr,date)]
+train <- train[order(class,store_nbr,date)]
+head(test)
+head(train)
+```
+
+
+
+## Model 1: Simple Moving Average
+
+Let's try a simple moving average model for each store-class combination and see how much better that is compared to the base model. Moving average models are generally good for giving trends, but they might perform well for some classes and less well for others.
+
+Since there are different data points that might stop and start at different times and since we want to forecast daily for the month ahead, we will set a moving average period between 2 and 30 days,depending on how much data we have for each store-class combination.
+
+Since we want several iterations of moving average for our dataset because we are trying to predict several periods in advance, let's at least have 3 iterations of the moving average. So the n will be equal to the integer of the total number of datapoints for each store-class divided by 3. 
+
+Let's just check what is our largest and smallest time series for a store-class combination. 
+
+```{r}
+store_class <- train[,.N,by=c("store_nbr","class")]
+store_class <- store_class[order(N)]
+head(store_class)
+store_class <- store_class[order(-N)]
+head(store_class)
+```
+
+So we can see that the highest number of data points for a store_class is 1126 and the lowest number of data points is 1. 
+
+Let's also check the distribution
+
+```{r}
+hist(store_class$N)
+```
+
+We can see that for the majority of points we have more than 1 point, which is good. 
+
+For the store-class combinations that have between 1 and 5 points, we will use n=1 as that will allow for some iterations of the forecast. For what is between 6 and 8, we will use 2 points as that will allow at least 3 iterations of the MA. For everything above 9, we will divide by 3 to get the n, and once we get over 30 datapoints, we use p=10. We need to strike a balance between monthly trends and daily forecast. 
+
+Creating the stores and classes vectors
+```{r}
+stores <- unique(test$store_nbr)
+classes <- unique(test$class)
+
+```
+
+```{r}
+for (c in 1:length(classes)){
+  for (s in 1:length(stores)) {
+    data_points <- store_class[store_nbr==stores[s] & class==class[c],N]
+    if (data_points<=5){
+      p<-1
+    } else if (data_points<=8) {
+      p<-2
+    } else if (data_points<30) {
+      p<-3
+    } else p<-10
+    p
+    ts <- train[store_nbr==stores[s] & class==class[c],c("store_nbr","class","date","sales_per_unit")]
+    ts_test <- test[store_nbr==stores[s] & class==class[c],c("store_nbr","class","date","sales_per_unit")]
+    head(ts)
+    sma <- sma(ts$sales_per_unit,n=p)
+    sma_predictions <- forecast(sma,nrow(ts_test))
+    ts_test$predictions <- sma_predictions$forecast
+    # for the first iteration create a data.table with the results, 
+    # for the rest of the iterations append the results to the first data table. 
+    if (c==1 & s==1) {
+      sma_model1_results <- ts_test
+    } else sma_model1_results <- rbind(sma_model1_results,ts_test)
+  }
+}
+  
+    
+```
+
+
+
+
+
+
+
+
