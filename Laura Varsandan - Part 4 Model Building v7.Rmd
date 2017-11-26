@@ -931,9 +931,13 @@ subset_families <- unique(avg_rez[average_residual>5 | average_residual<5,"famil
 subset_families
 ```
 
-All of them. 
+Let's save the output of the final model but also the actual values for the month before
 
-Let's vizualize family by day of month - no particular trends
-
-
+```{r}
+write.csv(test,"test.csv")
+m=unique(test$month_year)
+m
+last_month <- train[month_year==m-2]
+write.csv(last_month,"last_month.csv")
+```
 
